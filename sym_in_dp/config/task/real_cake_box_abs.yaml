@@ -36,5 +36,7 @@ dataset:
   rotation_rep: 'rotation_6d'
   use_legacy_normalizer: False
   use_cache: True
+  image_compressor: null
+  normalize_rel_action: True
   seed: 42
   val_ratio: 0.0

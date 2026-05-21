@@ -77,9 +77,12 @@ class RobomimicReplayImageDataset(BaseImageDataset):
                             replay_buffer.save_to_store(
                                 store=zip_store
                             )
-                    except Exception as e:
-                        shutil.rmtree(cache_zarr_path)
-                        raise e
+                    except Exception:
+                        if os.path.isdir(cache_zarr_path):
+                            shutil.rmtree(cache_zarr_path)
+                        elif os.path.exists(cache_zarr_path):
+                            os.remove(cache_zarr_path)
+                        raise
                 else:
                     print('Loading cached ReplayBuffer from Disk.')
                     with zarr.ZipStore(cache_zarr_path, mode='r') as zip_store:
@@ -318,14 +321,21 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
                 dtype=this_data.dtype
             )
 
-        def img_copy(zarr_arr, zarr_idx, hdf5_arr, hdf5_idx):
-            try:
-                zarr_arr[zarr_idx] = hdf5_arr[hdf5_idx]
-                # make sure we can successfully decode
-                _ = zarr_arr[zarr_idx]
-                return True
-            except Exception as e:
-                return False
+        def img_copy(zarr_arr, zarr_idx, hdf5_arr, hdf5_idx, expected_hwc_shape):
+            image = hdf5_arr[hdf5_idx]
+            if image.shape == expected_hwc_shape:
+                pass
+            elif image.shape == (expected_hwc_shape[2], expected_hwc_shape[0], expected_hwc_shape[1]):
+                image = np.moveaxis(image, 0, -1)
+            else:
+                raise ValueError(
+                    f"Unexpected image shape {image.shape}; expected "
+                    f"{expected_hwc_shape} (HWC) or "
+                    f"{(expected_hwc_shape[2], expected_hwc_shape[0], expected_hwc_shape[1])} (CHW)."
+                )
+            zarr_arr[zarr_idx] = image
+            # make sure we can successfully decode
+            _ = zarr_arr[zarr_idx]
 
         with tqdm(total=n_steps * len(rgb_keys), desc="Loading image data", mininterval=1.0) as pbar:
             # one chunk per thread, therefore no synchronization needed
@@ -352,18 +362,16 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
                                 completed, futures = concurrent.futures.wait(futures,
                                                                              return_when=concurrent.futures.FIRST_COMPLETED)
                                 for f in completed:
-                                    if not f.result():
-                                        raise RuntimeError('Failed to encode image!')
+                                    f.result()
                                 pbar.update(len(completed))
 
                             zarr_idx = episode_starts[episode_idx] + hdf5_idx
                             futures.add(
                                 executor.submit(img_copy,
-                                                img_arr, zarr_idx, hdf5_arr, hdf5_idx))
+                                                img_arr, zarr_idx, hdf5_arr, hdf5_idx, (h, w, c)))
                 completed, futures = concurrent.futures.wait(futures)
                 for f in completed:
-                    if not f.result():
-                        raise RuntimeError('Failed to encode image!')
+                    f.result()
                 pbar.update(len(completed))
 
     replay_buffer = ReplayBuffer(root)

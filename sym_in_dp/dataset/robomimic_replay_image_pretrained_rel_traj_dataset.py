@@ -47,6 +47,8 @@ class RobomimicReplayImagePretrainedRelTrajDataset(BaseImageDataset):
                  rotation_rep='rotation_6d',  # ignored when abs_action=False
                  use_legacy_normalizer=False,
                  use_cache=False,
+                 image_compressor='jpeg2k',
+                 normalize_rel_action=False,
                  seed=42,
                  val_ratio=0.0,
                  n_demo=100,
@@ -73,15 +75,19 @@ class RobomimicReplayImagePretrainedRelTrajDataset(BaseImageDataset):
                             dataset_path=dataset_path,
                             abs_action=abs_action,
                             rotation_transformer=rotation_transformer,
+                            image_compressor=image_compressor,
                             n_demo=n_demo)
                         print('Saving cache to disk.')
                         with zarr.ZipStore(cache_zarr_path) as zip_store:
                             replay_buffer.save_to_store(
                                 store=zip_store
                             )
-                    except Exception as e:
-                        shutil.rmtree(cache_zarr_path)
-                        raise e
+                    except Exception:
+                        if os.path.isdir(cache_zarr_path):
+                            shutil.rmtree(cache_zarr_path)
+                        elif os.path.exists(cache_zarr_path):
+                            os.remove(cache_zarr_path)
+                        raise
                 else:
                     print('Loading cached ReplayBuffer from Disk.')
                     with zarr.ZipStore(cache_zarr_path, mode='r') as zip_store:
@@ -95,6 +101,7 @@ class RobomimicReplayImagePretrainedRelTrajDataset(BaseImageDataset):
                 dataset_path=dataset_path,
                 abs_action=abs_action,
                 rotation_transformer=rotation_transformer,
+                image_compressor=image_compressor,
                 n_demo=n_demo)
 
         rgb_keys = list()
@@ -141,6 +148,7 @@ class RobomimicReplayImagePretrainedRelTrajDataset(BaseImageDataset):
         self.pad_before = pad_before
         self.pad_after = pad_after
         self.use_legacy_normalizer = use_legacy_normalizer
+        self.normalize_rel_action = normalize_rel_action
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
@@ -208,8 +216,11 @@ class RobomimicReplayImagePretrainedRelTrajDataset(BaseImageDataset):
             if self.use_legacy_normalizer:
                 this_normalizer = normalizer_from_stat(stat)
         else:
-            # already normalized
-            this_normalizer = get_identity_normalizer_from_stat(stat)
+            if self.normalize_rel_action:
+                this_normalizer = get_range_normalizer_from_stat(stat)
+            else:
+                # already normalized
+                this_normalizer = get_identity_normalizer_from_stat(stat)
         normalizer['action'] = this_normalizer
 
         # obs
@@ -293,6 +304,7 @@ def _convert_actions(raw_actions, abs_action, rotation_transformer):
 
 
 def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, rotation_transformer,
+                                 image_compressor='jpeg2k',
                                  n_workers=None, max_inflight_tasks=None, n_demo=100):
     if n_workers is None:
         n_workers = multiprocessing.cpu_count()
@@ -319,6 +331,23 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
     with h5py.File(dataset_path) as file:
         # count total steps
         demos = file['data']
+        n_available_demos = len(demos)
+        if n_demo is None:
+            n_demo = n_available_demos
+        if n_demo > n_available_demos:
+            raise ValueError(
+                f"Requested n_demo={n_demo}, but dataset only contains "
+                f"{n_available_demos} demos in {dataset_path}."
+            )
+        missing_demo_keys = [
+            f'demo_{i}' for i in range(n_demo)
+            if f'demo_{i}' not in demos
+        ]
+        if missing_demo_keys:
+            raise KeyError(
+                f"Dataset {dataset_path} is missing expected demos: "
+                f"{missing_demo_keys[:5]}"
+            )
         episode_ends = list()
         prev_end = 0
         for i in range(n_demo):
@@ -360,14 +389,21 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
                 dtype=this_data.dtype
             )
 
-        def img_copy(zarr_arr, zarr_idx, hdf5_arr, hdf5_idx):
-            try:
-                zarr_arr[zarr_idx] = hdf5_arr[hdf5_idx]
-                # make sure we can successfully decode
-                _ = zarr_arr[zarr_idx]
-                return True
-            except Exception as e:
-                return False
+        def img_copy(zarr_arr, zarr_idx, hdf5_arr, hdf5_idx, expected_hwc_shape):
+            image = hdf5_arr[hdf5_idx]
+            if image.shape == expected_hwc_shape:
+                pass
+            elif image.shape == (expected_hwc_shape[2], expected_hwc_shape[0], expected_hwc_shape[1]):
+                image = np.moveaxis(image, 0, -1)
+            else:
+                raise ValueError(
+                    f"Unexpected image shape {image.shape}; expected "
+                    f"{expected_hwc_shape} (HWC) or "
+                    f"{(expected_hwc_shape[2], expected_hwc_shape[0], expected_hwc_shape[1])} (CHW)."
+                )
+            zarr_arr[zarr_idx] = image
+            # make sure we can successfully decode
+            _ = zarr_arr[zarr_idx]
 
         with tqdm(total=n_steps * len(rgb_keys), desc="Loading image data", mininterval=1.0) as pbar:
             # one chunk per thread, therefore no synchronization needed
@@ -377,7 +413,12 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
                     data_key = 'obs/' + key
                     shape = tuple(shape_meta['obs'][key]['shape'])
                     c, h, w = shape
-                    this_compressor = Jpeg2k(level=50)
+                    if image_compressor in (None, 'none', 'raw'):
+                        this_compressor = None
+                    elif image_compressor == 'jpeg2k':
+                        this_compressor = Jpeg2k(level=50)
+                    else:
+                        raise ValueError(f"Unsupported image_compressor: {image_compressor}")
                     img_arr = data_group.require_dataset(
                         name=key,
                         shape=(n_steps, h, w, c),
@@ -394,18 +435,16 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
                                 completed, futures = concurrent.futures.wait(futures,
                                                                              return_when=concurrent.futures.FIRST_COMPLETED)
                                 for f in completed:
-                                    if not f.result():
-                                        raise RuntimeError('Failed to encode image!')
+                                    f.result()
                                 pbar.update(len(completed))
 
                             zarr_idx = episode_starts[episode_idx] + hdf5_idx
                             futures.add(
                                 executor.submit(img_copy,
-                                                img_arr, zarr_idx, hdf5_arr, hdf5_idx))
+                                                img_arr, zarr_idx, hdf5_arr, hdf5_idx, (h, w, c)))
                 completed, futures = concurrent.futures.wait(futures)
                 for f in completed:
-                    if not f.result():
-                        raise RuntimeError('Failed to encode image!')
+                    f.result()
                 pbar.update(len(completed))
 
     replay_buffer = ReplayBuffer(root)

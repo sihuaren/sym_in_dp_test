@@ -79,6 +79,12 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
 
         run_validation = OmegaConf.select(cfg.training, "run_validation", default=True)
         run_rollout = OmegaConf.select(cfg.training, "run_rollout", default=True)
+        sample_every = OmegaConf.select(cfg.training, "sample_every", default=None)
+        run_train_sampling = (
+            sample_every is not None
+            and sample_every is not False
+            and sample_every > 0
+        )
 
         # configure validation dataset
         val_dataloader = None
@@ -171,7 +177,7 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                     for batch_idx, batch in enumerate(tepoch):
                         # device transfer
                         batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                        if train_sampling_batch is None:
+                        if run_train_sampling and train_sampling_batch is None:
                             train_sampling_batch = batch
 
                         # compute loss
@@ -247,7 +253,7 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                             step_log['val_loss'] = val_loss
 
                 # run diffusion sampling on a training batch
-                if (self.epoch % cfg.training.sample_every) == 0:
+                if run_train_sampling and (self.epoch % sample_every) == 0:
                     with torch.no_grad():
                         # sample trajectory from training set, and evaluate difference
                         batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))

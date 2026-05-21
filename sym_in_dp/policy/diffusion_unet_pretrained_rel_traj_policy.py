@@ -28,6 +28,7 @@ class DiffusionUnetPretrainedRelTrajPolicy(BaseImagePolicy):
             kernel_size=5,
             n_groups=8,
             cond_predict_scale=True,
+            input_action_space='auto',
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -36,6 +37,20 @@ class DiffusionUnetPretrainedRelTrajPolicy(BaseImagePolicy):
         action_shape = shape_meta['action']['shape']
         assert len(action_shape) == 1
         action_dim = action_shape[0]
+        if input_action_space == 'auto':
+            input_action_space = 'relative_axis_angle' if action_dim == 7 else 'absolute_6d'
+        if input_action_space not in ('relative_axis_angle', 'absolute_6d'):
+            raise ValueError(f"Unsupported input_action_space: {input_action_space}")
+        if input_action_space == 'relative_axis_angle' and action_dim != 7:
+            raise ValueError(
+                "input_action_space='relative_axis_angle' expects action shape [7] "
+                f"(xyz + rotvec + gripper), got {action_shape}."
+            )
+        if input_action_space == 'absolute_6d' and action_dim < 9:
+            raise ValueError(
+                "input_action_space='absolute_6d' expects action shape at least [9] "
+                f"(xyz + rotation_6d + optional gripper), got {action_shape}."
+            )
         # get feature dim
         obs_feature_dim = obs_encoder.output_shape()[0]
 
@@ -77,6 +92,7 @@ class DiffusionUnetPretrainedRelTrajPolicy(BaseImagePolicy):
         self.n_action_steps = n_action_steps
         self.n_obs_steps = n_obs_steps
         self.obs_as_global_cond = obs_as_global_cond
+        self.input_action_space = input_action_space
         self.kwargs = kwargs
 
         if num_inference_steps is None:
@@ -192,6 +208,16 @@ class DiffusionUnetPretrainedRelTrajPolicy(BaseImagePolicy):
         naction_pred = nsample[...,:Da]
         action_pred = self.normalizer['action'].unnormalize(naction_pred)
 
+        start = To - 1
+        end = start + self.n_action_steps
+        if self.input_action_space == 'relative_axis_angle':
+            action = action_pred[:,start:end]
+            result = {
+                'action': action,
+                'action_pred': action_pred
+            }
+            return result
+
         xyz = action_pred[:, :, :3]
         rot_6d = action_pred[:, :, 3:9]
         rot = self.sixd_to_mat.forward(rot_6d)
@@ -212,8 +238,6 @@ class DiffusionUnetPretrainedRelTrajPolicy(BaseImagePolicy):
         abs_action = torch.cat([abs_xyz, abs_rot_6d, action_pred[:, :, 9:]], dim=-1)
 
         # get action
-        start = To - 1
-        end = start + self.n_action_steps
         action = abs_action[:,start:end]
         
         result = {
@@ -230,23 +254,30 @@ class DiffusionUnetPretrainedRelTrajPolicy(BaseImagePolicy):
         # normalize input
         batch = copy.deepcopy(batch)
         assert 'valid_mask' not in batch
-        del batch['obs']['agentview_image']
+        batch['obs'].pop('agentview_image', None)
 
-        # First convert to relative coordinates
-        abs_xyz = batch['action'][:, :, :3]
-        abs_6d = batch['action'][:, :, 3:9]
-        abs_T = torch.eye(4).repeat(batch['action'].shape[0], batch['action'].shape[1], 1, 1).to(self.device)
-        abs_T[:, :, :3, :3] = self.sixd_to_mat.forward(abs_6d)
-        abs_T[:, :, :3, 3] = abs_xyz
-        cur_T = torch.eye(4).repeat(batch['action'].shape[0], batch['action'].shape[1], 1, 1).to(self.device)
-        cur_T[:, :, :3, :3] = self.quat_to_mat.forward(batch['obs']['robot0_eef_quat'][:, :, [3, 0, 1, 2]][:, -1:])
-        cur_T[:, :, :3, 3] = batch['obs']['robot0_eef_pos'][:, -1:]
-        rel_T = cur_T.inverse() @ abs_T
-        rel_xyz = rel_T[:, :, :3, 3]
-        rel_6d = self.sixd_to_mat.inverse(rel_T[:, :, :3, :3])
-        rel_action = torch.cat([rel_xyz, rel_6d, batch['action'][:, :, 9:]], dim=-1)
-
-        batch['action'] = rel_action
+        if self.input_action_space == 'absolute_6d':
+            # Convert absolute target poses to relative actions before diffusion.
+            abs_xyz = batch['action'][:, :, :3]
+            abs_6d = batch['action'][:, :, 3:9]
+            abs_T = torch.eye(
+                4,
+                device=batch['action'].device,
+                dtype=batch['action'].dtype
+            ).repeat(batch['action'].shape[0], batch['action'].shape[1], 1, 1)
+            abs_T[:, :, :3, :3] = self.sixd_to_mat.forward(abs_6d)
+            abs_T[:, :, :3, 3] = abs_xyz
+            cur_T = torch.eye(
+                4,
+                device=batch['action'].device,
+                dtype=batch['action'].dtype
+            ).repeat(batch['action'].shape[0], batch['action'].shape[1], 1, 1)
+            cur_T[:, :, :3, :3] = self.quat_to_mat.forward(batch['obs']['robot0_eef_quat'][:, :, [3, 0, 1, 2]][:, -1:])
+            cur_T[:, :, :3, 3] = batch['obs']['robot0_eef_pos'][:, -1:]
+            rel_T = cur_T.inverse() @ abs_T
+            rel_xyz = rel_T[:, :, :3, 3]
+            rel_6d = self.sixd_to_mat.inverse(rel_T[:, :, :3, :3])
+            batch['action'] = torch.cat([rel_xyz, rel_6d, batch['action'][:, :, 9:]], dim=-1)
 
         nobs = self.normalizer.normalize(batch['obs'])
         nactions = self.normalizer['action'].normalize(batch['action'])
