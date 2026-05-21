@@ -61,16 +61,17 @@ class FR3Config:
 
 @dataclass
 class TaskConfig:
-    server_host: str = "10.184.17.133"
+    server_host: str = "10.184.17.132"
     server_port: int = 5001
-    task_description: str = "cake_box"
     run_seconds: float = 600.0
     control_hz: int = 5
     execute_actions: bool = True
     action_horizon: int = 8
     merge_count: int = 4
-    action_input: str = "auto"
     gripper_close_threshold: float = 0.9
+
+
+ACTION_INPUT_MODE = "relative_traj"
 
 
 def frame_field(frame: Any, *names: str) -> Any:
@@ -126,6 +127,28 @@ def gripper_qpos_from_width(width: Any) -> np.ndarray:
     return np.asarray([0.5 * width, 0.5 * width], dtype=np.float32)
 
 
+def pose_to_matrix(pos: np.ndarray, quat_xyzw: np.ndarray) -> np.ndarray:
+    matrix = np.eye(4, dtype=np.float64)
+    matrix[:3, :3] = R.from_quat(quat_xyzw).as_matrix()
+    matrix[:3, 3] = np.asarray(pos, dtype=np.float64).reshape(3)
+    return matrix
+
+
+def relative_traj_to_matrix(relative_traj: np.ndarray) -> np.ndarray:
+    relative_traj = np.asarray(relative_traj, dtype=np.float64).reshape(-1)
+    matrix = np.eye(4, dtype=np.float64)
+    matrix[:3, :3] = R.from_rotvec(relative_traj[3:6]).as_matrix()
+    matrix[:3, 3] = relative_traj[:3]
+    return matrix
+
+
+def matrix_to_relative_traj(matrix: np.ndarray) -> np.ndarray:
+    matrix = np.asarray(matrix, dtype=np.float64).reshape(4, 4)
+    pos = matrix[:3, 3].astype(np.float32)
+    rotvec = R.from_matrix(matrix[:3, :3]).as_rotvec().astype(np.float32)
+    return np.concatenate([pos, rotvec], axis=0)
+
+
 class SYMDPPolicyClient:
     def __init__(self, cfg: TaskConfig) -> None:
         from websocket import websocket_client_policy
@@ -136,7 +159,6 @@ class SYMDPPolicyClient:
 
     def inference(self, observation: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
         request = dict(observation)
-        request["task_description"] = self.cfg.task_description
         result = self.policy_client.infer(request)
         return (
             np.asarray(result["actions"], dtype=np.float32),
@@ -150,7 +172,7 @@ class SYMDPRealBotClient:
         self.task_cfg = task_cfg
         self.policy_client = SYMDPPolicyClient(task_cfg)
         self.server_metadata = self.policy_client.server_metadata
-        self.action_input = self._resolve_action_input()
+        self._validate_server_metadata()
 
         self.scene_camera = None
         self.wrist_camera = None
@@ -165,45 +187,37 @@ class SYMDPRealBotClient:
         self._load_action_mapping()
         self.setup_hardware()
         print(f"SYMDP server metadata: {self.server_metadata}")
-        print(f"SYMDP action input mode: {self.action_input}")
+        print(f"SYMDP action input mode: {ACTION_INPUT_MODE}")
 
-    def _resolve_action_input(self) -> str:
-        requested = self.task_cfg.action_input
+    def _validate_server_metadata(self) -> None:
         server_mode = self.server_metadata.get("action_input")
-        aliases = {
-            "relative": "relative_trajectory",
-            "relative_trajectory": "relative_trajectory",
-            "delta": "delta",
-            "absolute": "absolute",
-        }
-        if requested == "auto":
-            if server_mode in aliases:
-                return aliases[server_mode]
-            action_shape = tuple(self.server_metadata.get("action_shape", ()))
-            return "relative_trajectory" if action_shape == (7,) else "absolute"
-
-        requested_mode = aliases[requested]
-        if server_mode in aliases and requested_mode != aliases[server_mode]:
-            logging.warning("Client action_input=%s differs from server action_input=%s.", requested_mode, server_mode)
-        return requested_mode
+        if server_mode is not None and server_mode != ACTION_INPUT_MODE:
+            raise ValueError(
+                f"SYMDP realbot client only supports {ACTION_INPUT_MODE} actions, "
+                f"but server action_input is {server_mode!r}."
+            )
+        action_shape = tuple(self.server_metadata.get("action_shape", ()))
+        if action_shape and action_shape != (7,):
+            raise ValueError(
+                f"SYMDP realbot client only supports 7D {ACTION_INPUT_MODE} actions, "
+                f"but server action_shape is {action_shape}."
+            )
 
     def _load_action_mapping(self) -> None:
         try:
             from algo.utils.action_mapping import (  # type: ignore
-                absolute_joint_action_mapping,
                 absolute_position_action_mapping,
                 delta_absolute_position_action_mapping,
-                delta_joint_action_mapping,
             )
         except Exception as exc:
             raise ImportError("Could not import algo.utils.action_mapping in the robot environment.") from exc
 
         self.action_mapping = {
             "POSITION_DELTA": delta_absolute_position_action_mapping.__get__(self),
-            "JOINT_DELTA": delta_joint_action_mapping.__get__(self),
             "POSITION_ABSOLUTE": absolute_position_action_mapping.__get__(self),
-            "JOINT_ABSOLUTE": absolute_joint_action_mapping.__get__(self),
         }
+        if self.robot_cfg.action_mode not in self.action_mapping:
+            raise ValueError(f"{ACTION_INPUT_MODE} actions require a cartesian position action mode.")
 
     def setup_hardware(self) -> None:
         from roby.hardware.cameras.realsense.camera_realsense import RealSenseCamera, RealSenseCameraConfig
@@ -310,69 +324,35 @@ class SYMDPRealBotClient:
     def _relative_action_to_absolute_pose(
         self,
         action: np.ndarray,
-        base_pose: tuple[np.ndarray, np.ndarray],
+        gripper_pose: tuple[np.ndarray, np.ndarray],
     ) -> tuple[np.ndarray, R]:
-        base_pos, base_quat = base_pose
-        base_rot = R.from_quat(base_quat)
-        rel_rot = R.from_rotvec(action[3:6])
-        target_pos = base_pos + base_rot.apply(action[:3])
-        target_rot = base_rot * rel_rot
-        return target_pos.astype(np.float32), target_rot
-
-    def _delta_action_to_absolute_pose(self, action: np.ndarray) -> tuple[np.ndarray, R]:
-        state = self.robot.read_state()
-        current_pos, current_quat = parse_eef_state(state)
-        current_rot = R.from_quat(current_quat)
-        delta_rot = R.from_rotvec(action[3:6])
-        target_pos = current_pos + action[:3]
-        target_rot = current_rot * delta_rot
-        return target_pos.astype(np.float32), target_rot
+        gripper_pos, gripper_quat = gripper_pose
+        abs_pose = pose_to_matrix(gripper_pos, gripper_quat) @ relative_traj_to_matrix(action)
+        return abs_pose[:3, 3].astype(np.float32), R.from_matrix(abs_pose[:3, :3])
 
     def convert_action_for_robot(
         self,
         action: np.ndarray,
-        base_pose: Optional[tuple[np.ndarray, np.ndarray]] = None,
     ) -> np.ndarray:
         action = np.asarray(action, dtype=np.float32).reshape(-1)
-        if action.size < 7:
-            raise ValueError(f"SYMDP action expects at least 7 values, got {action.size}")
-        if self.action_input == "relative_trajectory" and base_pose is None:
-            raise ValueError("Relative trajectory actions require the observation-time base pose Tt.")
-        if self.action_input == "relative_trajectory" and self.robot_cfg.action_mode not in (
-            "POSITION_DELTA",
-            "POSITION_ABSOLUTE",
-        ):
-            raise ValueError("Relative trajectory actions are cartesian and require a position action mode.")
+        if action.size != 7:
+            raise ValueError(f"SYMDP {ACTION_INPUT_MODE} action expects 7 values, got {action.size}")
 
         gripper_target = self._gripper_command_to_target(action[-1])
+        state = self.robot.read_state()
+        current_pos, current_quat = parse_eef_state(state)
+        target_pos, target_rot = self._relative_action_to_absolute_pose(action, (current_pos, current_quat))
+
         if self.robot_cfg.action_mode == "POSITION_DELTA":
-            if self.action_input == "relative_trajectory":
-                target_pos, target_rot = self._relative_action_to_absolute_pose(action, base_pose)
-                state = self.robot.read_state()
-                current_pos, current_quat = parse_eef_state(state)
-                delta_pos = target_pos - current_pos
-                delta_quat = (R.from_quat(current_quat).inv() * target_rot).as_quat()
-            elif self.action_input == "absolute":
-                state = self.robot.read_state()
-                current_pos, current_quat = parse_eef_state(state)
-                delta_pos = action[:3] - current_pos
-                delta_quat = (R.from_quat(current_quat).inv() * R.from_rotvec(action[3:6])).as_quat()
-            else:
-                delta_pos = action[:3]
-                delta_quat = R.from_rotvec(action[3:6]).as_quat()
+            delta_pos = target_pos - current_pos
+            delta_quat = (R.from_quat(current_quat).inv() * target_rot).as_quat()
             return np.concatenate([delta_pos, delta_quat, [gripper_target]]).astype(np.float32)
 
         if self.robot_cfg.action_mode == "POSITION_ABSOLUTE":
-            if self.action_input == "relative_trajectory":
-                pos, rot = self._relative_action_to_absolute_pose(action, base_pose)
-            elif self.action_input == "delta":
-                pos, rot = self._delta_action_to_absolute_pose(action)
-            else:
-                pos, rot = action[:3], R.from_rotvec(action[3:6])
-            euler_deg = rot.as_euler("xyz", degrees=True)
-            return np.concatenate([pos, euler_deg, [gripper_target]]).astype(np.float32)
+            euler_deg = target_rot.as_euler("xyz", degrees=True)
+            return np.concatenate([target_pos, euler_deg, [gripper_target]]).astype(np.float32)
 
-        return action.astype(np.float32)
+        raise ValueError(f"{ACTION_INPUT_MODE} actions require a cartesian position action mode.")
 
     def merge_actions(self, actions: np.ndarray) -> np.ndarray:
         actions = np.asarray(actions, dtype=np.float32)
@@ -386,31 +366,23 @@ class SYMDPRealBotClient:
         merged = []
         for start in range(0, len(actions), merge_count):
             chunk = actions[start : start + merge_count]
-            if self.action_input == "delta":
-                pos = np.sum(chunk[:, :3], axis=0)
-                composed_rot = R.identity()
-                for rotvec in chunk[:, 3:6]:
-                    composed_rot = composed_rot * R.from_rotvec(rotvec)
-                rot = composed_rot.as_rotvec()
-            else:
-                # Relative trajectory waypoints all use the same observation-time frame Tt.
-                # Merging keeps the last waypoint in the chunk, not the sum of increments.
-                pos = chunk[-1, :3]
-                rot = chunk[-1, 3:6]
+            relative_pose = np.eye(4, dtype=np.float64)
+            for step in chunk:
+                relative_pose = relative_pose @ relative_traj_to_matrix(step)
+            pose_6d = matrix_to_relative_traj(relative_pose)
 
             gripper_commands = chunk[:, 6]
             active = gripper_commands[np.abs(gripper_commands) >= self.task_cfg.gripper_close_threshold]
             gripper = np.asarray([active[-1] if active.size else 0.0], dtype=np.float32)
-            merged.append(np.concatenate([pos, rot, gripper], axis=0))
+            merged.append(np.concatenate([pose_6d, gripper], axis=0))
         return np.asarray(merged, dtype=np.float32)
 
     def move(
         self,
         action: np.ndarray,
-        base_pose: Optional[tuple[np.ndarray, np.ndarray]] = None,
         execute: bool = True,
     ) -> None:
-        robot_action = self.convert_action_for_robot(action, base_pose=base_pose)
+        robot_action = self.convert_action_for_robot(action)
         if self.robot_cfg.action_mode == "POSITION_DELTA":
             delta_rotvec = R.from_quat(robot_action[3:7]).as_rotvec()
             print("SYMDP robot delta action:", np.concatenate([robot_action[:3], delta_rotvec, robot_action[-1:]]))
@@ -436,16 +408,12 @@ class SYMDPRealBotClient:
         while not self._stop_event.is_set():
             try:
                 obs = self.read_observation()
-                base_pose = (
-                    np.asarray(obs["robot0_eef_pos"], dtype=np.float32).reshape(3),
-                    np.asarray(obs["robot0_eef_quat"], dtype=np.float32).reshape(4),
-                )
                 actions, _ = self.policy_client.inference(obs)
                 actions = self.merge_actions(actions[: self.task_cfg.action_horizon])
                 print(f"SYMDP merged actions: {len(actions)} from horizon {self.task_cfg.action_horizon}")
                 print(f"SYMDP merged action[0]: {actions[0]}")
                 for action in actions:
-                    self.move(action, base_pose=base_pose, execute=self.task_cfg.execute_actions)
+                    self.move(action, execute=self.task_cfg.execute_actions)
             except RuntimeError as exc:
                 print(exc)
             except Exception as exc:
@@ -497,19 +465,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RealBot client for SYMDP websocket policy inference.")
     parser.add_argument("--server-host", default=TaskConfig.server_host)
     parser.add_argument("--server-port", type=int, default=TaskConfig.server_port)
-    parser.add_argument("--task-description", default=TaskConfig.task_description)
     parser.add_argument("--run-seconds", type=float, default=TaskConfig.run_seconds)
     parser.add_argument("--control-hz", type=int, default=TaskConfig.control_hz)
     parser.add_argument("--dry-run", action="store_true", help="Run inference but do not send actions to the robot.")
     parser.add_argument("--action-horizon", type=int, default=TaskConfig.action_horizon)
     parser.add_argument("--merge-count", type=int, default=TaskConfig.merge_count)
     parser.add_argument("--gripper-close-threshold", type=float, default=TaskConfig.gripper_close_threshold)
-    parser.add_argument(
-        "--action-input",
-        choices=("auto", "relative", "relative_trajectory", "delta", "absolute"),
-        default=TaskConfig.action_input,
-        help="Use server metadata by default. Current 7D SYMDP checkpoints use relative_trajectory.",
-    )
 
     parser.add_argument("--robot-ip", default=FR3Config.robot_ip)
     parser.add_argument("--scene-camera-id", default=FR3Config.scene_camera_id)
@@ -518,7 +479,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--color-order", choices=("rgb", "bgr"), default=FR3Config.color_order)
     parser.add_argument(
         "--action-mode",
-        choices=("POSITION_DELTA", "JOINT_DELTA", "POSITION_ABSOLUTE", "JOINT_ABSOLUTE"),
+        choices=("POSITION_DELTA", "POSITION_ABSOLUTE"),
         default=FR3Config.action_mode,
     )
     parser.add_argument("--no-home", action="store_true")
@@ -540,13 +501,11 @@ def main() -> None:
     task_cfg = TaskConfig(
         server_host=args.server_host,
         server_port=args.server_port,
-        task_description=args.task_description,
         run_seconds=args.run_seconds,
         control_hz=args.control_hz,
         execute_actions=not args.dry_run,
         action_horizon=args.action_horizon,
         merge_count=args.merge_count,
-        action_input=args.action_input,
         gripper_close_threshold=args.gripper_close_threshold,
     )
     SYMDPRealBotClient(robot_cfg, task_cfg).run()

@@ -12,6 +12,8 @@ import numpy as np
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 DEFAULT_CHECKPOINT = "/data1/user/rensihua/sym_in_dp/data/outputs/2026.05.21/13.58.30_diff_c_real_cake_box/checkpoints/epoch=0590-train_loss=0.006.ckpt"
+ACTION_INPUT_MODE = "relative_traj"
+ACTION_FORMULA = "T_abs = T_gripper @ T_relative_traj"
 
 sys.path.insert(0, str(SCRIPT_DIR))
 sys.path.append(str(PROJECT_ROOT))
@@ -160,7 +162,6 @@ class SYMDPWebsocketPolicy(_base_policy.BasePolicy):
     ) -> None:
         import torch
         from omegaconf import OmegaConf
-        from sym_in_dp.model.common.rotation_transformer import RotationTransformer
 
         self.torch = torch
         self.device = torch.device(device)
@@ -168,10 +169,14 @@ class SYMDPWebsocketPolicy(_base_policy.BasePolicy):
         self.shape_meta = OmegaConf.to_container(self.cfg.shape_meta, resolve=True)
         self.obs_shape_meta = self.shape_meta["obs"]
         self.action_shape = shape_tuple(self.shape_meta["action"]["shape"])
+        if self.action_shape != (7,):
+            raise ValueError(
+                f"SYMDP websocket policy only supports 7D {ACTION_INPUT_MODE} actions, "
+                f"got action shape {self.action_shape}."
+            )
         self.n_obs_steps = int(getattr(self.policy, "n_obs_steps", self.cfg.n_obs_steps))
         self.obs_history: deque[dict[str, np.ndarray]] = deque(maxlen=self.n_obs_steps)
         self.gripper_qpos_mode = gripper_qpos_mode
-        self.rotation_6d_to_axis_angle = RotationTransformer(from_rep="rotation_6d", to_rep="axis_angle")
 
         self.rgb_keys = [
             key for key, attr in self.obs_shape_meta.items()
@@ -216,26 +221,17 @@ class SYMDPWebsocketPolicy(_base_policy.BasePolicy):
         if actions.ndim == 1:
             actions = actions[None]
         action_dim = actions.shape[-1]
-        if action_dim == 7:
-            return actions.astype(np.float32)
-        if action_dim >= 10:
-            pos = actions[:, :3]
-            rotvec = self.rotation_6d_to_axis_angle.forward(actions[:, 3:9]).astype(np.float32)
-            gripper = actions[:, 9:10]
-            return np.concatenate([pos, rotvec, gripper], axis=-1).astype(np.float32)
-        raise ValueError(f"Unsupported SYMDP action dimension: {action_dim}")
+        if action_dim != 7:
+            raise ValueError(f"SYMDP {ACTION_INPUT_MODE} action dimension must be 7, got {action_dim}.")
+        return actions.astype(np.float32)
 
     @property
     def action_input_mode(self) -> str:
-        if self.action_shape == (7,):
-            return "relative_trajectory"
-        return "absolute"
+        return ACTION_INPUT_MODE
 
     @property
     def action_formula(self) -> str:
-        if self.action_input_mode == "relative_trajectory":
-            return "A_abs[i] = T_observation @ A_relative[i]"
-        return "A_abs[i] = action[i]"
+        return ACTION_FORMULA
 
     def infer(self, obs: dict[str, Any]) -> dict[str, Any]:
         entry = self.observation_to_entry(obs)
@@ -256,15 +252,10 @@ class SYMDPWebsocketPolicy(_base_policy.BasePolicy):
         response = {
             "actions": action_7d.tolist(),
             "predicted_trajs": pred_7d.tolist(),
-            "actions_raw": action_raw.tolist(),
-            "predicted_trajs_raw": pred_raw.tolist(),
             "n_obs_steps": self.n_obs_steps,
             "action_input": self.action_input_mode,
             "action_formula": self.action_formula,
         }
-        if action_raw.shape[-1] != 7:
-            response["actions_model_space"] = action_raw.tolist()
-            response["predicted_trajs_model_space"] = pred_raw.tolist()
         return response
 
 
@@ -302,9 +293,7 @@ def main() -> None:
             "action_shape": policy.action_shape,
             "action_input": policy.action_input_mode,
             "action_formula": policy.action_formula,
-            "action_format": "relative_x relative_y relative_z relative_rotvec_x relative_rotvec_y relative_rotvec_z gripper"
-            if policy.action_input_mode == "relative_trajectory"
-            else "x y z rotvec_x rotvec_y rotvec_z gripper",
+            "action_format": "relative_x relative_y relative_z relative_rotvec_x relative_rotvec_y relative_rotvec_z gripper",
         },
     )
     print(f"Serving SYMDP policy on ws://{args.host}:{args.port}")
