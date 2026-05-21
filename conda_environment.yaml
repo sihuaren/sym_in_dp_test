@@ -55,5 +55,5 @@ dependencies:
     - wandb==0.17.0
     - pygame
     - imagecodecs==2022.9.26
-    - escnn @ https://github.com/pointW/escnn/archive/fc4714cb6dc0d2a32f9fcea35771968b89911109.tar.gz
+    - escnn @ https://ghfast.top/https://github.com/pointW/escnn/archive/fc4714cb6dc0d2a32f9fcea35771968b89911109.tar.gz
     - timm

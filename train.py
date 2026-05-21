@@ -34,6 +34,8 @@ max_steps = {
     'lift': 400,
     'square': 400,
     'three_piece_assembly_d0': 500,
+    "cake_box": 400,
+    
 }
 
 def get_ws_x_center(task_name):
