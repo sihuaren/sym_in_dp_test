@@ -1,0 +1,186 @@
+defaults:
+  - _self_
+  - task: real_cake_box_abs_dual_view
+
+name: diff_c_real_dual_view
+_target_: sym_in_dp.workspace.train_diffusion_unet_hybrid_workspace_new.TrainDiffusionUnetHybridWorkspace
+
+exp_name: "cake_box_no_val_dual_view"
+
+task_name: cake_box
+n_demo: 50
+horizon: 16
+n_obs_steps: 2
+low_dim_obs_horizon: 2
+img_obs_horizon: 1
+n_action_steps: 8
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+past_action_visible: False
+obs_as_global_cond: True
+dataset: sym_in_dp.dataset.robomimic_replay_image_pretrained_rel_traj_dataset.RobomimicReplayImagePretrainedRelTrajDataset
+dataset_path: /home/rsh/code/sym_in_dp_test/cake_box_260514.hdf5
+# /hard_data/user_dataset/rensihua_dataset/realbot_260518/hdf5/cake_box_260514.hdf5
+
+shape_meta:
+  obs:
+    agentview_image:
+      shape: [ 3, 84, 84 ]
+      horizon: ${img_obs_horizon}
+      type: rgb
+    robot0_eye_in_hand_image:
+      shape: [ 3, 84, 84 ]
+      horizon: ${img_obs_horizon}
+      type: rgb
+    robot0_eef_pos:
+      shape: [ 3 ]
+      horizon: ${low_dim_obs_horizon}
+      # type default: low_dim
+    robot0_eef_quat:
+      shape: [ 4 ]
+      horizon: ${low_dim_obs_horizon}
+    robot0_gripper_qpos:
+      shape: [ 2 ]
+      horizon: ${low_dim_obs_horizon}
+  action:
+    shape: [ 7 ]
+
+
+policy:
+  _target_: sym_in_dp.policy.diffusion_unet_pretrained_dual_view_rel_traj_policy.DiffusionUnetPretrainedDualViewRelTrajPolicy
+
+  shape_meta: ${shape_meta}
+  input_action_space: relative_axis_angle
+
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    variance_type: fixed_small
+    clip_sample: True
+    prediction_type: epsilon
+
+  obs_encoder:
+    _target_: sym_in_dp.model.vision.timm_obs_encoder.C8EquivariantTimmObsEncoder
+    shape_meta: ${shape_meta}
+    model_name: 'resnet18.tv_in1k'
+    pretrained: True
+    frozen: False
+    global_pool: ''
+
+    # 'avg' or 'max' or 'soft_attention' or 'spatial_embedding' or 'transformer' or 'attention_pool_2d'
+    feature_aggregation: 'attention_pool_2d'
+    # feature_aggregation: 'adaptive_avg_pool2d'
+    # feature_aggregation: null
+    position_encording: 'sinusoidal' # 'learnable' or 'sinusoidal'. it only works for transformer
+
+    # it only works for resnet. 32 (7x7) or 16 (14x14)
+    downsample_ratio: 32
+
+    transforms:
+      # - _target_: torchvision.transforms.Resize
+      #   size: 224
+      #   antialias: True
+      - _target_: torchvision.transforms.Normalize
+        mean: [0.485, 0.456, 0.406]
+        std: [0.229, 0.224, 0.225]
+      - _target_: sym_in_dp.model.vision.timm_obs_encoder.TrainRandomTestCenterCrop
+        size: 76
+    use_group_norm: True
+    # Share one RGB backbone so both camera views use the same encoder weights.
+    share_rgb_model: True
+    imagenet_norm: True
+
+  horizon: ${horizon}
+  n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
+  n_obs_steps: ${n_obs_steps}
+  num_inference_steps: 100
+  obs_as_global_cond: ${obs_as_global_cond}
+  # crop_shape: [76, 76]
+  diffusion_step_embed_dim: 128
+  down_dims: [256, 512, 1024]
+  kernel_size: 5
+  n_groups: 8
+  cond_predict_scale: True
+
+ema:
+  _target_: sym_in_dp.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 64
+  num_workers: 4
+  shuffle: True
+  pin_memory: True
+  persistent_workers: True
+
+val_dataloader:
+  batch_size: 64
+  num_workers: 4
+  shuffle: False
+  pin_memory: True
+  persistent_workers: True
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+
+training:
+  device: "cuda:0"
+  seed: 0
+  debug: False
+  resume: True
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 600
+  gradient_accumulate_every: 1
+  use_ema: True
+  run_rollout: False
+  run_validation: False
+  rollout_every: 1
+  checkpoint_every: 10
+  val_every: 1
+  sample_every: null
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+logging:
+  project: diffusion_policy_${task_name}
+  resume: True
+  mode: offline
+  name: diff_c_real_rel_traj_${task_name}_dual_view
+  tags: ["${name}", "${task_name}", "${exp_name}"]
+  id: null
+  group: null
+
+checkpoint:
+  topk:
+    monitor_key: train_loss
+    mode: min
+    k: 2
+    format_str: 'epoch={epoch:04d}-train_loss={train_loss:.3f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}
