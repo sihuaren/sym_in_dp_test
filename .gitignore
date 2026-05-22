@@ -141,3 +141,5 @@ dmypy.json
 
 # Ignore large dataset files
 third_party/robomimic/datasets/**/*.hdf5
+epoch=0530-train_loss=0.007.ckpt
+cake_box_260514.hdf5
