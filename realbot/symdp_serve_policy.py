@@ -162,8 +162,6 @@ class SYMDPWebsocketPolicy(_base_policy.BasePolicy):
     ) -> None:
         import torch
         from omegaconf import OmegaConf
-        from sym_in_dp.model.common.rotation_transformer import RotationTransformer
-
         self.torch = torch
         self.device = torch.device(device)
         self.cfg, self.policy = load_policy_from_checkpoint(checkpoint, self.device)
