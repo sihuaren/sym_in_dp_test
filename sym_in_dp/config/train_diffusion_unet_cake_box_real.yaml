@@ -19,8 +19,7 @@ dataset_obs_steps: ${n_obs_steps}
 past_action_visible: False
 obs_as_global_cond: True
 dataset: sym_in_dp.dataset.robomimic_replay_image_pretrained_rel_traj_dataset.RobomimicReplayImagePretrainedRelTrajDataset
-dataset_path: /hard_data/user_dataset/rensihua_dataset/realbot_260518/hdf5/cake_box_260514.hdf5
-# /home/rsh/code/sym_in_dp_test/cake_box_260514.hdf5
+dataset_path: /home/rsh/code/sym_in_dp_test/cake_box_260514.hdf5
 # /hard_data/user_dataset/rensihua_dataset/realbot_260518/hdf5/cake_box_260514.hdf5
 
 shape_meta:
@@ -153,7 +152,7 @@ training:
 logging:
   project: diffusion_policy_${task_name}
   resume: True
-  mode: online
+  mode: offline
   name: diff_c_real_rel_traj_${task_name}
   tags: ["${name}", "${task_name}", "${exp_name}"]
   id: null

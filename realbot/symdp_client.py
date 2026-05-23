@@ -151,7 +151,7 @@ def matrix_to_relative_traj(matrix: np.ndarray) -> np.ndarray:
 
 class SYMDPPolicyClient:
     def __init__(self, cfg: TaskConfig) -> None:
-        from websocket import websocket_client_policy
+        from utils import websocket_client_policy
 
         self.cfg = cfg
         self.policy_client = websocket_client_policy.WebsocketClientPolicy(cfg.server_host, cfg.server_port)
@@ -317,7 +317,7 @@ class SYMDPRealBotClient:
         command = float(command)
         if command >= self.task_cfg.gripper_close_threshold:
             return 1.0
-        if command <= -self.task_cfg.gripper_close_threshold:
+        if command <= self.task_cfg.gripper_close_threshold:
             return 0.0
         return float(self.current_gripper_state)
 
@@ -412,6 +412,7 @@ class SYMDPRealBotClient:
                 actions = self.merge_actions(actions[: self.task_cfg.action_horizon])
                 print(f"SYMDP merged actions: {len(actions)} from horizon {self.task_cfg.action_horizon}")
                 print(f"SYMDP merged action[0]: {actions[0]}")
+                print(f"SYMDP merged action[1]: {actions[1]}")
                 for action in actions:
                     self.move(action, execute=self.task_cfg.execute_actions)
             except RuntimeError as exc:
