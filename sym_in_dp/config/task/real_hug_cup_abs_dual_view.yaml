@@ -1,0 +1,42 @@
+name: real_hug_cup_abs_dual_view
+
+shape_meta: &shape_meta
+  # HDF5 is expected to follow robomimic layout:
+  # data/demo_*/obs/<obs_key> and data/demo_*/actions.
+  obs:
+    agentview_image:
+      shape: [3, 84, 84]
+      type: rgb
+    robot0_eye_in_hand_image:
+      shape: [3, 84, 84]
+      type: rgb
+    robot0_eef_pos:
+      shape: [3]
+    robot0_eef_quat:
+      shape: [4]
+    robot0_gripper_qpos:
+      shape: [2]
+  action:
+    shape: [7]
+
+abs_action: &abs_action False
+
+env_runner: null
+
+dataset:
+  _target_: ${dataset}
+  n_demo: ${n_demo}
+  shape_meta: *shape_meta
+  dataset_path: ${dataset_path}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  n_obs_steps: ${dataset_obs_steps}
+  abs_action: *abs_action
+  rotation_rep: 'rotation_6d'
+  use_legacy_normalizer: False
+  use_cache: True
+  image_compressor: null
+  normalize_rel_action: True
+  seed: 42
+  val_ratio: 0.0

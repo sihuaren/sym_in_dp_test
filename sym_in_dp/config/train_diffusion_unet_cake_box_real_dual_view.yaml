@@ -19,7 +19,7 @@ dataset_obs_steps: ${n_obs_steps}
 past_action_visible: False
 obs_as_global_cond: True
 dataset: sym_in_dp.dataset.robomimic_replay_image_pretrained_rel_traj_dataset.RobomimicReplayImagePretrainedRelTrajDataset
-dataset_path: /home/rsh/code/sym_in_dp_test/cake_box_260514.hdf5
+dataset_path: /hard_data/user_dataset/rensihua_dataset/realbot_260518/hdf5/cake_box_260514_new.hdf5
 # /hard_data/user_dataset/rensihua_dataset/realbot_260518/hdf5/cake_box_260514.hdf5
 
 shape_meta:

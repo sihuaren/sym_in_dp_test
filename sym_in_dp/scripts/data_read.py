@@ -22,8 +22,7 @@ import pyarrow.parquet as pq
 
 
 DEFAULT_PARQUET = (
-    "/hard_data/user_dataset/rensihua_dataset/realbot_260518/"
-    "cake_box_260514/episode_00000.parquet"
+    "/hard_data/user_dataset/rensihua_dataset/realbot_260518/hug_cup_260513/episode_00000.parquet"
 )
 
 

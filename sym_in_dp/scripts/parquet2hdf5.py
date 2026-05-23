@@ -59,6 +59,35 @@ def first_present(row: pd.Series, names: list[str]) -> Any:
     return None
 
 
+def image_key_candidates(camera: str, explicit_key: Optional[str]) -> list[str]:
+    if explicit_key is not None:
+        return [explicit_key]
+    return [
+        f"{camera}/color",
+        camera,
+        f"{camera}/rgb",
+        f"{camera}/image",
+        f"{camera}_color",
+        f"{camera}_rgb",
+        f"{camera}_image",
+    ]
+
+
+def resolve_image_key(
+    columns: pd.Index,
+    camera: str,
+    explicit_key: Optional[str],
+    label: str,
+) -> str:
+    candidates = image_key_candidates(camera, explicit_key)
+    for key in candidates:
+        if key in columns:
+            return key
+    raise KeyError(
+        f"Could not find {label} image column. Tried: {candidates}"
+    )
+
+
 def normalize_quat_xyzw(quat: np.ndarray) -> np.ndarray:
     quat = np.asarray(quat, dtype=np.float64).reshape(4)
     norm = np.linalg.norm(quat)
@@ -269,17 +298,36 @@ def resize_rgb_chw(image: Optional[np.ndarray], size: int, input_color_order: st
         rgb = np.zeros((size, size, 3), dtype=np.uint8)
         return np.moveaxis(rgb, -1, 0)
 
+    if image.ndim == 3 and image.shape[0] in (1, 3, 4) and image.shape[-1] not in (1, 3, 4):
+        image = np.moveaxis(image, 0, -1)
+
     if image.ndim == 2:
         image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    elif image.ndim != 3:
+        rgb = np.zeros((size, size, 3), dtype=np.uint8)
+        return np.moveaxis(rgb, -1, 0)
+    elif image.shape[-1] == 1:
+        image = np.repeat(image, 3, axis=-1)
     elif image.shape[-1] == 4:
         image = image[..., :3]
+    elif image.shape[-1] != 3:
+        rgb = np.zeros((size, size, 3), dtype=np.uint8)
+        return np.moveaxis(rgb, -1, 0)
 
     if input_color_order == "bgr":
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     elif input_color_order != "rgb":
         raise ValueError(f"Unsupported image color order: {input_color_order}")
 
-    rgb = image.astype(np.uint8)
+    if image.dtype == np.uint8:
+        rgb = image
+    else:
+        rgb = image.astype(np.float32)
+        finite = np.isfinite(rgb)
+        if finite.any() and rgb[finite].max() <= 1.0:
+            rgb = rgb * 255.0
+        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+
     if rgb.shape[0] != size or rgb.shape[1] != size:
         rgb = cv2.resize(rgb, (size, size), interpolation=cv2.INTER_AREA)
     return np.moveaxis(rgb.astype(np.uint8), -1, 0)
@@ -352,10 +400,20 @@ def build_episode(
     eef_quat = []
     gripper = []
     eye_images = []
+    agentview_images = []
 
-    image_key = args.eye_image_key
-    if image_key is None:
-        image_key = f"{args.eye_camera}/color"
+    image_key = resolve_image_key(
+        df.columns,
+        camera=args.eye_camera,
+        explicit_key=args.eye_image_key,
+        label="eye-in-hand",
+    )
+    agentview_image_key = resolve_image_key(
+        df.columns,
+        camera=args.agentview_camera,
+        explicit_key=args.agentview_image_key,
+        label="agentview",
+    )
 
     for curr, nxt, command in zip(final_rows, filtered_rows[1:], commands):
         row = df.iloc[curr["row_pos"]]
@@ -371,6 +429,7 @@ def build_episode(
         )
 
         image = decode_image(row.get(image_key))
+        agentview_image = decode_image(row.get(agentview_image_key))
 
         actions.append(action)
         eef_pos.append(curr["pose"][:3].astype(np.float32))
@@ -383,6 +442,13 @@ def build_episode(
                 input_color_order=args.eye_image_color_order,
             )
         )
+        agentview_images.append(
+            resize_rgb_chw(
+                agentview_image,
+                size=args.image_size,
+                input_color_order=args.agentview_image_color_order,
+            )
+        )
 
     return {
         "actions": np.stack(actions, axis=0).astype(np.float32),
@@ -390,6 +456,7 @@ def build_episode(
         "robot0_eef_quat": np.stack(eef_quat, axis=0).astype(np.float32),
         "robot0_gripper_qpos": np.stack(gripper, axis=0).astype(np.float32),
         "robot0_eye_in_hand_image": np.stack(eye_images, axis=0).astype(np.uint8),
+        "agentview_image": np.stack(agentview_images, axis=0).astype(np.uint8),
     }
 
 
@@ -404,6 +471,7 @@ def write_demo(data_group: h5py.Group, demo_idx: int, episode: dict[str, np.ndar
     obs.create_dataset("robot0_eef_quat", data=episode["robot0_eef_quat"], compression=compression)
     obs.create_dataset("robot0_gripper_qpos", data=episode["robot0_gripper_qpos"], compression=compression)
     obs.create_dataset("robot0_eye_in_hand_image", data=episode["robot0_eye_in_hand_image"], compression=compression)
+    obs.create_dataset("agentview_image", data=episode["agentview_image"], compression=compression)
     return int(episode["actions"].shape[0])
 
 
@@ -411,8 +479,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Convert real-robot parquet episodes into a SymInDP image HDF5 dataset."
     )
-    parser.add_argument("--input", type=Path, default='/hard_data/user_dataset/rensihua_dataset/realbot_260518/cake_box_260514', help="Parquet file or directory. One parquet is treated as one episode.")
-    parser.add_argument("--output", type=Path, default='/hard_data/user_dataset/rensihua_dataset/realbot_260518/hdf5/cake_box_260514', help="Merged output HDF5 path.")
+    parser.add_argument("--input", type=Path, default='/hard_data/user_dataset/rensihua_dataset/realbot_260518/hug_cup_260513', help="Parquet file or directory. One parquet is treated as one episode.")
+    parser.add_argument("--output", type=Path, default='/hard_data/user_dataset/rensihua_dataset/realbot_260518/hdf5/hug_cup_260513_new', help="Merged output HDF5 path.")
     parser.add_argument("--recursive", action="store_true", help="Recursively scan input directory.")
     parser.add_argument("--max-episodes", type=int, default=None)
     parser.add_argument("--skip-errors", action="store_true")
@@ -424,6 +492,22 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         choices=("bgr", "rgb"),
         default="rgb",
         help="Channel order returned by decoding the wrist image before saving as RGB.",
+    )
+    parser.add_argument(
+        "--agentview-camera",
+        default="left_camera",
+        help="Parquet camera prefix for agentview_image. Defaults to left_camera.",
+    )
+    parser.add_argument(
+        "--agentview-image-key",
+        default=None,
+        help="Parquet column containing the agentview image. Defaults to left_camera/color fallbacks.",
+    )
+    parser.add_argument(
+        "--agentview-image-color-order",
+        choices=("bgr", "rgb"),
+        default="rgb",
+        help="Channel order returned by decoding the agentview image before saving as RGB.",
     )
     parser.add_argument("--image-size", type=int, default=84)
 
@@ -476,6 +560,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         f"Eye image: key={args.eye_image_key or f'{args.eye_camera}/color'}, "
         f"layout=CHW, size=3x{args.image_size}x{args.image_size}"
     )
+    print(
+        f"Agentview image: key={args.agentview_image_key or f'{args.agentview_camera}/color'}, "
+        f"layout=CHW, size=3x{args.image_size}x{args.image_size}"
+    )
 
     total_samples = 0
     written = 0
@@ -488,6 +576,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         h5.attrs["eye_image_stored_color_order"] = "rgb"
         h5.attrs["eye_image_layout"] = "chw"
         h5.attrs["eye_image_size"] = int(args.image_size)
+        h5.attrs["agentview_image_input_color_order"] = args.agentview_image_color_order
+        h5.attrs["agentview_image_stored_color_order"] = "rgb"
+        h5.attrs["agentview_image_layout"] = "chw"
+        h5.attrs["agentview_image_size"] = int(args.image_size)
         h5.attrs["has_point_cloud"] = False
         h5.attrs["has_voxels"] = False
 
