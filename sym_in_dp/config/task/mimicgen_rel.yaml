@@ -40,7 +40,7 @@ env_runner:
   past_action: ${past_action_visible}
   abs_action: *abs_action
   tqdm_interval_sec: 1.0
-  n_envs: 28
+  n_envs: 14
 
 dataset:
   # _target_: sym_in_dp.dataset.robomimic_replay_image_dataset.RobomimicReplayImageDataset
